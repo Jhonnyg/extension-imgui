@@ -6,20 +6,14 @@
 
 #define LIB_NAME "ImGui"
 
-// Need this preamble for Linux gl headers to work
 #include "imgui/imgui.h"
 #include "imgui/imconfig.h"
-
-// set in imconfig.h
-#if defined(IMGUI_IMPL_OPENGL_LOADER_GL3W)
-#include <GL/gl3w.h>
-#endif
 
 // imgui renderer backend and possible platform extras
 #if defined(DM_PLATFORM_ANDROID)
 #include "imgui/imgui_impl_android.h"
 #endif
-#include "imgui/imgui_impl_opengl3.h"
+#include "imgui_impl_defold.h"
 
 #include <dmsdk/sdk.h>
 
@@ -42,12 +36,13 @@
 
 typedef struct ImgObject
 {
-    int                w;
-    int                h;
-    int                comp;
-    GLuint             tid;
-    char               name[MAX_IMAGE_NAME];
-    unsigned char *    data;
+	int                w;
+	int                h;
+	int                comp;
+	uint32_t           tid;
+	dmGraphics::HTexture texture;
+	char               name[MAX_IMAGE_NAME];
+	unsigned char *    data;
 } ImgObject;
 
 enum ExtImGuiGlyphRanges {
@@ -66,7 +61,6 @@ static bool g_imgui_NewFrame        = false;
 static char* g_imgui_TextBuffer     = 0;
 static dmArray<ImFont*> g_imgui_Fonts;
 static dmArray<ImgObject> g_imgui_Images;
-static bool g_VerifyGraphicsCalls   = false;
 static bool g_RenderingEnabled      = true;
 
 #define DEFOLD_IMGUI_MAX_DRAW_CALLBACKS 16
@@ -146,17 +140,6 @@ static void imgui_ClearDrawCallbacks()
 }
 
 
-static void imgui_ClearGLError()
-{
-    if (!g_VerifyGraphicsCalls) return;
-    GLint err = glGetError();
-    while (err != 0)
-    {
-        err = glGetError();
-    }
-}
-
-
 // ----------------------------
 // ----- IMAGES ---------------
 // ----------------------------
@@ -195,11 +178,13 @@ static int imgui_ImageInternalLoad(const char *filename, ImgObject *image)
         return 0;
     }
 
-    dmLogInfo("imgui_ImageInternalLoad before %d", image->tid);
-
-    glGenTextures(1, &image->tid);
-    dmLogInfo("imgui_ImageInternalLoad after %d", image->tid);
-    glBindTexture(GL_TEXTURE_2D, image->tid);
+    image->texture = ImGui_ImplDefold_CreateTexture(image->w, image->h, image->data);
+    if (!image->texture)
+    {
+        dmLogError("Error creating image texture: %s", filename);
+        return 0;
+    }
+    image->tid = ImGui_ImplDefold_RegisterTexture(image->texture);
 
     strcpy(image->name, filename);
     if (g_imgui_Images.Full())
@@ -207,13 +192,6 @@ static int imgui_ImageInternalLoad(const char *filename, ImgObject *image)
         g_imgui_Images.OffsetCapacity(2);
     }
     g_imgui_Images.Push(*image);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); // This is required on WebGL for non power-of-two textures
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE); // Same
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->w, image->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image->data);
-
     return 1;
 }
 
@@ -340,7 +318,7 @@ static int imgui_ImageLoad(lua_State* L)
 static int imgui_ImageGet( lua_State *L )
 {
     DM_LUA_STACK_CHECK(L, 3);
-    GLuint tid = (GLuint)luaL_checkinteger(L, 1);
+    uint32_t tid = (uint32_t)luaL_checkinteger(L, 1);
 
     for (int i = 0; i < g_imgui_Images.Size(); i++)
     {
@@ -373,7 +351,7 @@ static int imgui_ImageGet( lua_State *L )
 static int imgui_ImageAdd( lua_State *L )
 {
     DM_LUA_STACK_CHECK(L, 0);
-    GLuint tid = (GLuint)luaL_checkinteger(L, 1);
+    uint32_t tid = (uint32_t)luaL_checkinteger(L, 1);
     int w = luaL_checknumber(L, 2);
     int h = luaL_checknumber(L, 3);
 
@@ -394,12 +372,13 @@ static int imgui_ImageAdd( lua_State *L )
 static int imgui_ImageFree( lua_State *L )
 {
     DM_LUA_STACK_CHECK(L, 0);
-    GLuint tid = (GLuint)luaL_checkinteger(L, 1);
+    uint32_t tid = (uint32_t)luaL_checkinteger(L, 1);
     for (int i = 0; i < g_imgui_Images.Size(); i++)
     {
         if (g_imgui_Images[i].tid == tid)
         {
-            glDeleteTextures(1, &tid);
+            ImGui_ImplDefold_DestroyTexture(g_imgui_Images[i].texture);
+            ImGui_ImplDefold_UnregisterTexture(tid);
             g_imgui_Images.EraseSwap(i);
             break;
         }
@@ -491,8 +470,7 @@ static void imgui_NewFrame()
 {
     if (g_imgui_NewFrame == false)
     {
-        ImGui_ImplOpenGL3_NewFrame();
-        imgui_ClearGLError();
+        ImGui_ImplDefold_NewFrame();
         ImGui::NewFrame();
         g_imgui_NewFrame = true;
     }
@@ -2228,7 +2206,7 @@ static int imgui_ButtonImage(lua_State* L)
     DM_LUA_STACK_CHECK(L, 1);
     int argc = lua_gettop(L);
     imgui_NewFrame();
-    GLuint tid = (GLuint)luaL_checknumber(L, 1);
+    uint32_t tid = (uint32_t)luaL_checknumber(L, 1);
     bool pushed = false;
     if(argc > 1)
     {
@@ -3647,10 +3625,8 @@ static dmExtension::Result imgui_Draw(dmExtension::Params* params)
 
     if (g_RenderingEnabled)
     {
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplDefold_RenderDrawData(ImGui::GetDrawData());
     }
-    
-    imgui_ClearGLError();
 
     g_imgui_NewFrame = false;
     return dmExtension::RESULT_OK;
@@ -3829,15 +3805,8 @@ static int imgui_SetIniFilename(lua_State* L)
 // ----- IMGUI INIT/SHUTDOWN --
 // ----------------------------
 
-static void imgui_Init(float width, float height)
+static void imgui_Init(float width, float height, dmResource::HFactory resource_factory)
 {
-    #if defined(IMGUI_IMPL_OPENGL_LOADER_GL3W)
-    int r = gl3wInit();
-    if (r != GL3W_OK) {
-        dmLogError("Failed to initialize OpenGL: %d", r);
-    }
-    #endif
-
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
 
@@ -3851,16 +3820,14 @@ static void imgui_Init(float width, float height)
         io.KeyMap[i] = 0;
     }
 
-    ImGui_ImplOpenGL3_Init();
-    imgui_ClearGLError();
+    ImGui_ImplDefold_Init(resource_factory);
 }
 
 static void imgui_Shutdown()
 {
     dmLogInfo("imgui_Shutdown");
 
-    ImGui_ImplOpenGL3_Shutdown();
-    imgui_ClearGLError();
+    ImGui_ImplDefold_Shutdown();
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
     ImGui::DestroyContext();
@@ -3888,7 +3855,8 @@ static void imgui_ExtensionShutdown()
 
     while (!g_imgui_Images.Empty())
     {
-        glDeleteTextures(1, &g_imgui_Images.Back().tid);
+        ImGui_ImplDefold_DestroyTexture(g_imgui_Images.Back().texture);
+        ImGui_ImplDefold_UnregisterTexture(g_imgui_Images.Back().tid);
         g_imgui_Images.Pop();
     }
 
@@ -5961,18 +5929,12 @@ static dmExtension::Result AppInitializeDefoldImGui(dmExtension::AppParams* para
 
 static dmExtension::Result InitializeDefoldImGui(dmExtension::Params* params)
 {
-    // This is actually more complex than this,
-    // but that value is buried deep in the private internals of dmGraphics_OpenGL
-    #ifdef DM_RELEASE
-    g_VerifyGraphicsCalls = false;
-    #else
-    g_VerifyGraphicsCalls = true;
-    #endif
-
     LuaInit(params->m_L);
     float displayWidth = dmConfigFile::GetFloat(params->m_ConfigFile, "display.width", 960.0f);
     float displayHeight = dmConfigFile::GetFloat(params->m_ConfigFile, "display.height", 540.0f);
-    imgui_Init(displayWidth, displayHeight);
+    HContextRegistry context_registry = ExtensionParamsGetContextRegistry((ExtensionParams*) params);
+    dmResource::HFactory resource_factory = (dmResource::HFactory) ContextRegistryGet(context_registry, RESOURCE_FACTORY_CONTEXT_NAME);
+    imgui_Init(displayWidth, displayHeight, resource_factory);
 
     return dmExtension::RESULT_OK;
 }
